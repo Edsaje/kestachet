@@ -233,35 +233,33 @@ flowchart TB
 
 ### 2.2 Schéma C3 : Niveau Composants (Component) — Zoom sur le "Service d'API & Synchronisation"
 
-Le schéma **C3 (Niveau Composants)** fait un **zoom à l'intérieur** du bloc `⚡ Service d'API & Synchronisation [Container: Spring Boot / Node]` pour montrer comment il fonctionne de l'intérieur :
+Le schéma **C3 (Niveau Composants)** fait un **zoom à l'intérieur** du bloc `⚡ Service d'API & Synchronisation [Container: Spring Boot / Node]` pour montrer comment il s'articule autour des **4 composants fondamentaux** de l'architecture logicielle :
+- **Controller** : Reçoit les requêtes HTTP/WSS, valide les entrées et délègue aux services.
+- **Service** : Contient la logique métier, réconcilie les modifications hors-ligne (CRDT) et orchestre les opérations.
+- **Repository** : Gère l'accès aux données, encapsule les requêtes SQL vers PostgreSQL.
+- **Domain Model** : Représente les entités métier au cœur du système (`User`, `Household`, `Cart`, `CartItem`, `Product`).
 
 ```mermaid
 flowchart TB
     %% Liens entrants depuis le C2
     subgraph CLIENTS ["Clients (Depuis C2)"]
-        APP_IN["📱 Application Mobile<br><i>[Container: Kotlin/Flutter]</i>"]
-        WEB_IN["💻 Application Web<br><i>[Container: React/HTTP]</i>"]
+        APP_IN["📱 Application Mobile<br><i>[Terminal Mobile]</i>"]
+        WEB_IN["💻 Application Web<br><i>[Terminal Web]</i>"]
     end
 
     %% ZOOM C3 SUR LE SERVICE D'API
     subgraph API_CONTAINER ["⚡ Service d'API & Synchronisation [Container: Spring Boot / Node]"]
         direction TB
 
-        subgraph ENTREE ["Composants de Contrôle (Entrée)"]
-            WS_CTRL["🔌 WebSocket Sync Handler<br><b>[Component: Controller]</b><br>Gère les flux bidirectionnels WSS temps réel"]
-            REST_CTRL["🌐 REST API Controller<br><b>[Component: Controller]</b><br>Endpoints HTTP (Auth, validation de panier)"]
-            AUTH_GUARD["🛡️ Security & JWT Filter<br><b>[Component: Middleware]</b><br>Vérifie l'identité de l'utilisateur et du foyer"]
-        end
+        CONTROLLER["🎮 Controller (REST & WebSocket)<br><b>[Component: Controller]</b><br>• Reçoit les requêtes HTTP & flux WSS<br>• Valide les entrées / DTOs<br>• Filtre de sécurité JWT & délègue au Service"]
 
-        subgraph METIER ["Composants Métier (Services)"]
-            SYNC_ENGINE["⚖️ Moteur de Résolution de Conflits<br><b>[Component: Service / CRDT]</b><br>Fusionne les deltas hors-ligne (1 + 1 = 2)"]
-            CART_SERVICE["🛒 Service Panier & Listes<br><b>[Component: Service]</b><br>Gère les articles, totaux et règles de foyer"]
-        end
+        SERVICE["⚙️ Service Métier (Cart & Sync Service)<br><b>[Component: Service]</b><br>• Contient la logique métier et orchestre les opérations<br>• Résout les conflits hors-ligne (CRDT)<br>• Applique les règles budgétaires du foyer"]
 
-        subgraph SORTIE ["Composants d'Accès aux Données & Sortie"]
-            DATA_REPO["💾 Data Access Repository<br><b>[Component: Repository]</b><br>Requêtes SQL optimisées vers PostgreSQL"]
-            ASYNC_DISPATCHER["📤 Async Analytics Dispatcher<br><b>[Component: Queue Producer]</b><br>Dépose les paniers validés sans bloquer le client"]
-        end
+        REPOSITORY["💾 Repository (Data Access Layer)<br><b>[Component: Repository]</b><br>• Gère l'accès aux données<br>• Encapsule les requêtes SQL vers PostgreSQL<br>• Isole la persistance du reste du code"]
+
+        DOMAIN["📦 Domain Model (Entités Métier)<br><b>[Component: Domain Model]</b><br>• User & Household (Comptes & Foyers)<br>• Cart (Panier & règles de budget)<br>• CartItem & Product (Articles & GTIN)"]
+
+        ASYNC_DISPATCHER["📤 Async Analytics Dispatcher<br><b>[Component: Queue Producer]</b><br>• Dépose les paniers validés en file d'attente (asynchrone)<br>• Découple l'API de la plateforme Analytics"]
     end
 
     %% Cibles sortantes vers C2
@@ -271,31 +269,27 @@ flowchart TB
     end
 
     %% Flux internes
-    APP_IN -->|"WSS (Deltas de scans)"| WS_CTRL
-    WEB_IN -->|"HTTPS / WSS"| REST_CTRL
+    APP_IN -->|"1. Pousse deltas & scans (WSS)"| CONTROLLER
+    WEB_IN -->|"1. Requêtes HTTP (Auth, listes)"| CONTROLLER
 
-    WS_CTRL --> AUTH_GUARD
-    REST_CTRL --> AUTH_GUARD
+    CONTROLLER -->|"2. Valide & délègue la requête"| SERVICE
+    SERVICE <-->|"3. Manipule les entités"| DOMAIN
+    SERVICE <-->|"4. Lit & sauvegarde l'état"| REPOSITORY
+    REPOSITORY <-->|"5. Requêtes SQL"| DB_OUT
 
-    AUTH_GUARD --> SYNC_ENGINE
-    AUTH_GUARD --> CART_SERVICE
-
-    SYNC_ENGINE -->|"Applique les deltas fusionnés"| CART_SERVICE
-
-    CART_SERVICE -->|"Lit et écrit les listes"| DATA_REPO
-    CART_SERVICE -->|"Lors de la validation du panier"| ASYNC_DISPATCHER
-
-    DATA_REPO -->|"SQL (JDBC/Pool)"| DB_OUT
-    ASYNC_DISPATCHER -->|"Envoi asynchrone (Queue/HTTP)"| DATA_OUT
+    SERVICE -->|"6. Notifie la validation du panier"| ASYNC_DISPATCHER
+    ASYNC_DISPATCHER -->|"7. Envoi asynchrone"| DATA_OUT
 ```
 
-#### Rôle de chaque composant interne (très simple à expliquer à l'oral) :
-1. **WebSocket Sync Handler** : Maintient la connexion ouverte en direct avec le smartphone dès qu'il capte à nouveau la 4G.
-2. **REST API Controller & Security Filter** : Reçoit les demandes classiques (connexion, validation du panier) et vérifie les droits du foyer (token JWT).
-3. **Moteur de Résolution de Conflits (CRDT)** : Reçoit les scans faits hors-ligne et les fusionne proprement pour ne jamais écraser d'article (addition des quantités).
-4. **Service Panier & Listes** : Applique les règles de calcul de la liste de courses et met à jour l'état officiel.
-5. **Data Access Repository** : Exécute les requêtes SQL vers la base centrale PostgreSQL.
-6. **Async Analytics Dispatcher** : Transmet le panier validé vers la plateforme Analytics de la startup *A Propos Des Biens* de manière asynchrone, sans jamais faire attendre l'utilisateur en caisse.
+#### Les 4 Composants Fondamentaux du C3 (à dire au jury) :
+
+| Composant | Rôle standard | Rôle concret dans **Kestachet** |
+| :--- | :--- | :--- |
+| **🎮 Controller** | Reçoit les requêtes HTTP/WSS, valide les entrées, délègue au service. | Gère les endpoints REST et la connexion WebSocket, valide les DTOs (GTIN, prix, quantités) et vérifie les tokens JWT. |
+| **⚙️ Service** | Contient la logique métier, orchestre les opérations. | Résout les conflits de synchronisation (CRDT), recalcule le budget, applique les règles de gestion du foyer et déclenche les événements. |
+| **💾 Repository** | Gère l'accès aux données, encapsule les requêtes SQL. | Fournit les méthodes d'accès (CRUD via JPA/Hibernate/Prisma) et exécute les requêtes SQL vers PostgreSQL. |
+| **📦 Domain Model** | Représente les entités métier au cœur de l'application. | Objets métier purs : `User`, `Household` (Foyer), `Cart` (Panier), `CartItem` (Article scanné), `Product` (Catalogue). |
+| **📤 Async Dispatcher** | Composant de sortie asynchrone (Queue / Broker). | Envoie le panier validé vers la plateforme Analytics *A Propos Des Biens* sans faire attendre l'utilisateur en caisse. |
 
 ---
 
