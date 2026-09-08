@@ -326,12 +326,45 @@ flowchart TB
 
 ## 💻 4. Niveau 4 : Code (C4)
 
-Le schéma de code zoome à l'échelle des classes orientées objet (diagramme de classes UML) sur le composant métier **`Moteur de Résolution de Conflits`** et **`Service Panier`**.
+Le schéma **C4 (Niveau Code)** zoome sur les classes orientées objet du conteneur API et concrétise le raccordement direct avec les niveaux **C1, C2, C3** et l'**Architecture Hexagonale (Étape 1)** :
+- **Couche Controller (C3)** : `SyncController` reçoit les flux HTTP/WSS et les DTOs `SyncDelta`.
+- **Couche Service (C3)** : `CartSyncService` orchestre la réconciliation sans conflit (CRDT), la persistance et la validation.
+- **Couche Domain Model (C3)** : `Cart`, `CartItem`, `BudgetStatus` (règles de calcul du budget).
+- **Couche Repository (C2 & C3)** : `CartRepositoryPort` et son implémentation SQL `PostgresCartRepository`.
+- **Couche Async Dispatcher (C1, C2 & C3)** : `AnalyticsDispatcherPort` et `KafkaAnalyticsDispatcher` pour l'envoi asynchrone vers la plateforme externe *A Propos Des Biens*.
 
 ```mermaid
 classDiagram
     direction TB
 
+    %% 1. COUCHE CONTROLLER (Entrée depuis C2 / C3)
+    class SyncController {
+        -CartSyncService cartSyncService
+        +handleSyncDeltas(UUID cartId, List~SyncDelta~ deltas) ResponseEntity
+        +validateAndCloseCart(UUID cartId) ResponseEntity
+    }
+
+    %% 2. DTO / PAYLOAD RÉSEAU (Scans hors-ligne)
+    class SyncDelta {
+        +UUID operationId
+        +String gtin
+        +String actionType
+        +int deltaQuantity
+        +Double price
+        +Long timestampNtp
+    }
+
+    %% 3. COUCHE SERVICE MÉTIER (Orchestration & CRDT depuis C3)
+    class CartSyncService {
+        -CartRepositoryPort cartRepository
+        -AnalyticsDispatcherPort analyticsDispatcher
+        +mergeIncomingDeltas(UUID cartId, List~SyncDelta~ deltas) Cart
+        +validateCart(UUID cartId) void
+        -applyPNCounter(CartItem item, int delta)
+        -resolvePriceLWW(CartItem item, Double newPrice, Long timestamp)
+    }
+
+    %% 4. COUCHE DOMAIN MODEL (Cœur Métier & Budget depuis Hexagone / C3)
     class Cart {
         +UUID id
         +UUID householdId
@@ -360,21 +393,7 @@ classDiagram
         RED
     }
 
-    class ConflictResolutionService {
-        +mergeDeltas(Cart cart, List~SyncDelta~ deltas) Cart
-        -applyPNCounter(CartItem item, int delta)
-        -resolvePriceLWW(CartItem item, Double newPrice, Long timestamp)
-    }
-
-    class SyncDelta {
-        +UUID operationId
-        +String gtin
-        +String actionType
-        +int deltaQuantity
-        +Double price
-        +Long timestampNtp
-    }
-
+    %% 5. COUCHE REPOSITORY (Persistance SQL PostgreSQL depuis C2 / C3)
     class CartRepositoryPort {
         <<interface>>
         +findById(UUID cartId) Cart
@@ -387,41 +406,81 @@ classDiagram
         +save(Cart cart) void
     }
 
-    %% Relations UML
+    %% 6. COUCHE ASYNC DISPATCHER (Ingestion Asynchrone Analytics depuis C1 / C2 / C3)
+    class AnalyticsDispatcherPort {
+        <<interface>>
+        +publishCartValidated(Cart cart) void
+    }
+
+    class KafkaAnalyticsDispatcher {
+        -KafkaTemplate kafkaTemplate
+        +publishCartValidated(Cart cart) void
+    }
+
+    %% RELATIONS INTER-CLASSES & INVERSION DE DÉPENDANCE
+    SyncController --> CartSyncService : délègue à
+    SyncController ..> SyncDelta : reçoit (DTO)
+    CartSyncService ..> SyncDelta : applique
+
+    CartSyncService --> CartRepositoryPort : charge & sauvegarde
+    CartSyncService --> AnalyticsDispatcherPort : notifie validation
+    CartSyncService ..> Cart : réconcilie & orchestre
+
+    PostgresCartRepository ..|> CartRepositoryPort : implémente (SQL)
+    KafkaAnalyticsDispatcher ..|> AnalyticsDispatcherPort : implémente (Queue)
+
     Cart "1" *-- "0..*" CartItem : contient
     Cart ..> BudgetStatus : évalue
-    ConflictResolutionService ..> Cart : réconcilie
-    ConflictResolutionService ..> SyncDelta : consomme
-    PostgresCartRepository ..|> CartRepositoryPort : implémente
 ```
 
 ### Algorithme concret d'implémentation (Java / Spring Boot) :
 
 ```java
 @Service
-public class ConflictResolutionService {
+public class CartSyncService {
+
+    private final CartRepositoryPort cartRepository;
+    private final AnalyticsDispatcherPort analyticsDispatcher;
+
+    public CartSyncService(CartRepositoryPort cartRepository, AnalyticsDispatcherPort analyticsDispatcher) {
+        this.cartRepository = cartRepository;
+        this.analyticsDispatcher = analyticsDispatcher;
+    }
 
     /**
-     * Fusionne les deltas hors-ligne reçus du smartphone sans écraser les données.
+     * 1. Fusionne les deltas hors-ligne reçus du smartphone sans écraser les données (CRDT).
      */
-    public Cart mergeDeltas(Cart cart, List<SyncDelta> incomingDeltas) {
-        for (SyncDelta delta : incomingDeltas) {
-            // Récupère l'article existant ou le crée s'il est nouveau
-            CartItem item = cart.findItemByGtin(delta.getGtin())
-                .orElseGet(() -> cart.createItem(delta.getGtin()));
+    public Cart mergeIncomingDeltas(UUID cartId, List<SyncDelta> incomingDeltas) {
+        Cart cart = cartRepository.findById(cartId);
 
-            // 1. Règle CRDT (PN-Counter) : on additionne le delta (+1, +2, etc.)
+        for (SyncDelta delta : incomingDeltas) {
+            CartItem item = cart.findOrCreateItem(delta.getGtin());
+
+            // 1.1 Règle CRDT (PN-Counter) : addition commutative (+1, +2, etc.)
             item.incrementQuantity(delta.getDeltaQuantity());
 
-            // 2. Règle Last-Write-Wins (LWW) sur le prix si saisi manuellement
+            // 1.2 Règle Last-Write-Wins (LWW) sur le prix si saisi manuellement
             if (delta.getPrice() != null && delta.getTimestampNtp() > item.getLastUpdatedTimestamp()) {
                 item.updatePrice(delta.getPrice(), delta.getTimestampNtp());
             }
         }
+
+        cartRepository.save(cart);
         return cart;
+    }
+
+    /**
+     * 2. Validation du panier et publication asynchrone vers Analytics (C1, C2, C3).
+     */
+    public void validateCart(UUID cartId) {
+        Cart cart = cartRepository.findById(cartId);
+        cartRepository.save(cart);
+
+        // Découplage asynchrone non bloquant vers la plateforme externe
+        analyticsDispatcher.publishCartValidated(cart);
     }
 }
 ```
 
-### 🗣️ Ce qu'on dit au jury sur le C4 (en 20 secondes) :
-> *"Le niveau 4 illustre notre modèle objet : la classe `Cart` regroupe des `CartItem`. La méthode `mergeDeltas` applique l'addition mathématique sur les quantités : deux téléphones ayant scanné 1 lait chacun produisent $1 + 1 = 2$ bouteilles. L'interface `CartRepositoryPort` respecte l'inversion de dépendance pour isoler le stockage SQL."*
+### 🗣️ Ce qu'on dit au jury sur le C4 (en 30 secondes) :
+> *"Le niveau 4 boucle parfaitement la boucle de notre architecture : le `SyncController` reçoit les `SyncDelta` des téléphones et appelle `CartSyncService`. Ce service applique notre algorithme CRDT mathématique ($1 + 1 = 2$) sur les entités du domaine (`Cart`, `CartItem`, `BudgetStatus`), persiste l'état via l'interface `CartRepositoryPort` dans PostgreSQL, et déclenche l'envoi asynchrone non-bloquant vers la plateforme Analytics via `AnalyticsDispatcherPort`."*
