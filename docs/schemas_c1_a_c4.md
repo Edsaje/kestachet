@@ -429,3 +429,86 @@ public class CartService {
 > *2. Il appelle le **CartService** qui contient la logique métier et calcule le budget.*
 > *3. Ce service manipule notre objet **Cart** qui regroupe les **CartItem**.*
 > *4. Enfin, le **CartRepository** sauvegarde le tout dans la base de données PostgreSQL."*
+
+---
+
+## 🔄 5. Diagrammes de Séquence (Dynamique du Système)
+
+Les diagrammes de séquence complètent la vue statique (C1 à C4) en illustrant **l'ordre chronologique des échanges** lors des deux scénarios clés de Kestachet.
+
+---
+
+### 5.1 Séquence 1 : Le Scan en rayon (Mode Hors-Ligne / Offline-First)
+
+Ce schéma montre ce qui se passe quand l'utilisateur scanne un article dans un supermarché **sans aucune connexion réseau** :
+- Tout se déroule localement sur le téléphone en **moins de 16 ms**.
+- La jauge budgétaire se met à jour immédiatement sur l'écran.
+- L'action est mémorisée dans un journal local (Outbox) pour synchronisation future.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as 👤 Utilisateur
+    participant APP as 📱 Application Mobile
+    participant DB as 💾 Base Locale (SQLite)
+    participant MOTEUR as ⚙️ Calculateur Budget
+
+    Note over U,MOTEUR: Scénario en rayon sans réseau (Zone blanche / Sous-sol)
+    
+    U->>APP: Vise le code-barres avec la caméra
+    APP->>APP: Décode le GTIN en direct (Google ML Kit)
+    APP->>DB: Recherche le produit dans le cache local
+    DB-->>APP: Produit trouvé (Nom, Prix : 2.50 €)
+    
+    APP->>MOTEUR: Demande le recalcul du budget
+    MOTEUR->>MOTEUR: Additionne le prix et vérifie le budget max
+    MOTEUR-->>APP: Nouveau total (ex: 42.50 €) + Jauge ORANGE
+    
+    APP->>DB: Enregistre le scan & empile dans le journal local (Outbox)
+    DB-->>APP: Confirmation d'écriture locale (10 ms)
+    
+    APP-->>U: Affiche l'article ajouté & met à jour la jauge de budget
+```
+
+> [!TIP] **Ce qu'on dit au jury sur la Séquence 1** :
+> *"Ce diagramme prouve notre fonctionnement **Offline-First** : chaque étape (scan caméra, recherche de l'article, calcul du budget et enregistrement SQLite) s'exécute à 100% sur le téléphone sans faire appel à internet. L'utilisateur n'a aucun ralentissement."*
+
+---
+
+### 5.2 Séquence 2 : Reconnexion 4G, Synchronisation et Envoi Analytics
+
+Ce schéma montre ce qui se passe quand l'utilisateur sort du magasin et que la connexion est rétablie :
+- L'application envoie son journal de modifications en attente.
+- L'API fusionne les articles sans conflit (CRDT : $1 + 1 = 2$).
+- Lors de la validation finale, l'utilisateur est libéré immédiatement en 50 ms pendant que le panier est transmis à la plateforme Analytics en arrière-plan.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant APP as 📱 Application Mobile
+    participant API as ⚡ API Backend (Spring Boot)
+    participant BDD as 🗄️ BDD Centrale (PostgreSQL)
+    participant DATA as 📊 Plateforme Analytics
+
+    Note over APP,DATA: Étape 1 : Synchronisation dès le retour de la 4G
+    APP->>APP: Détecte le retour du réseau (4G / Wi-Fi)
+    APP->>API: Envoie les scans en attente (Deltas de synchronisation)
+    
+    API->>BDD: Charge le panier officiel du foyer
+    BDD-->>API: Données actuelles du panier
+    
+    API->>API: Fusionne les scans sans conflit (CRDT : 1 + 1 = 2)
+    API->>BDD: Sauvegarde le panier mis à jour
+    BDD-->>API: Confirmation SQL
+    API-->>APP: Synchronisation réussie (Panier à jour)
+
+    Note over APP,DATA: Étape 2 : Validation des courses en caisse
+    APP->>API: "Terminer mes courses" (Validation finale)
+    API->>BDD: Marque le panier comme "VALIDÉ"
+    API-->>APP: 200 OK (Réponse immédiate en 50 ms pour libérer le client)
+    
+    API-)DATA: Transmet le panier validé en tâche de fond (Asynchrone)
+```
+
+> [!TIP] **Ce qu'on dit au jury sur la Séquence 2** :
+> *"Ce second diagramme illustre notre architecture distribuée résiliente : l'API réconcilie automatiquement les ajouts du foyer sans écrasement, et la validation du panier utilise un découplage asynchrone pour ne jamais faire attendre le client devant la caisse."*

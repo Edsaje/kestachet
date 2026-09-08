@@ -445,7 +445,70 @@ public class CartService {
 > *3. Ce service manipule notre objet **Cart** qui regroupe les **CartItem**.*
 > *4. Enfin, le **CartRepository** sauvegarde le tout dans la base de données PostgreSQL."*
 
-### 2.5 Comment on résout les conflits hors-ligne ? (Le cas Alice & Bob) (Le cas Alice & Bob)
+---
+
+### 2.5 Diagrammes de Séquence : La Dynamique du Système
+
+Les diagrammes de séquence illustrent **l'ordre chronologique des échanges** lors des deux scénarios opérationnels clés de Kestachet :
+
+#### 1. Scan en rayon en mode hors-ligne (Offline-First en moins de 16 ms)
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as 👤 Utilisateur
+    participant APP as 📱 Application Mobile
+    participant DB as 💾 Base Locale (SQLite)
+    participant MOTEUR as ⚙️ Calculateur Budget
+
+    Note over U,MOTEUR: Scénario en rayon sans réseau (Zone blanche / Sous-sol)
+    
+    U->>APP: Vise le code-barres avec la caméra
+    APP->>APP: Décode le GTIN en direct (Google ML Kit)
+    APP->>DB: Recherche le produit dans le cache local
+    DB-->>APP: Produit trouvé (Nom, Prix : 2.50 €)
+    
+    APP->>MOTEUR: Demande le recalcul du budget
+    MOTEUR->>MOTEUR: Additionne le prix et vérifie le budget max
+    MOTEUR-->>APP: Nouveau total (ex: 42.50 €) + Jauge ORANGE
+    
+    APP->>DB: Enregistre le scan & empile dans le journal local (Outbox)
+    DB-->>APP: Confirmation d'écriture locale (10 ms)
+    
+    APP-->>U: Affiche l'article ajouté & met à jour la jauge de budget
+```
+
+#### 2. Reconnexion 4G, Synchronisation et Envoi Analytics
+```mermaid
+sequenceDiagram
+    autonumber
+    participant APP as 📱 Application Mobile
+    participant API as ⚡ API Backend (Spring Boot)
+    participant BDD as 🗄️ BDD Centrale (PostgreSQL)
+    participant DATA as 📊 Plateforme Analytics
+
+    Note over APP,DATA: Étape 1 : Synchronisation collaborative dès le retour de la 4G
+    APP->>APP: Détecte le retour du réseau (4G / Wi-Fi)
+    APP->>API: Envoie les scans en attente (Deltas de synchronisation)
+    
+    API->>BDD: Charge le panier officiel du foyer
+    BDD-->>API: Données actuelles du panier
+    
+    API->>API: Fusionne les scans sans conflit (CRDT : 1 + 1 = 2)
+    API->>BDD: Sauvegarde le panier mis à jour
+    BDD-->>API: Confirmation SQL
+    API-->>APP: Synchronisation réussie (Panier à jour)
+
+    Note over APP,DATA: Étape 2 : Validation des courses en caisse
+    APP->>API: "Terminer mes courses" (Validation finale)
+    API->>BDD: Marque le panier comme "VALIDÉ"
+    API-->>APP: 200 OK (Réponse immédiate en 50 ms pour libérer le client)
+    
+    API-)DATA: Transmet le panier validé en tâche de fond (Asynchrone)
+```
+
+---
+
+### 2.6 Comment on résout les conflits hors-ligne ? (Le cas Alice & Bob)
 
 **Le problème concret :**
 Alice et Bob font les courses ensemble. Au sous-sol (sans réseau), Alice scanne **1 bouteille de lait**. De son côté au rayon frais, Bob scanne **aussi 1 bouteille de lait**. 
@@ -460,7 +523,7 @@ Quand ils sortent du magasin et retrouvent la 4G, que se passe-t-il ? Si le syst
 
 ---
 
-### 2.6 Pourquoi une File d'Attente pour Open Food Facts ?
+### 2.7 Pourquoi une File d'Attente pour Open Food Facts ?
 
 Quand l'utilisateur clique sur "Terminer mes courses" :
 - **Sans file d'attente (Mauvaise idée) :** L'application attendrait que le serveur aille interroger Open Food Facts. Si Open Food Facts est lent ou en panne, l'utilisateur attend 10 secondes devant la caisse.
@@ -472,7 +535,7 @@ Quand l'utilisateur clique sur "Terminer mes courses" :
 
 ---
 
-### 2.7 Avantages et Inconvénients de l'Architecture Distribuée
+### 2.8 Avantages et Inconvénients de l'Architecture Distribuée
 
 | Avantages | Inconvénients (Trade-offs) |
 | :--- | :--- |
